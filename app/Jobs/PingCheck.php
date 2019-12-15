@@ -46,6 +46,8 @@ class PingCheck implements ShouldQueue
 
     private $process;
     private $rrd_tags;
+    private $use_snmp_ping;
+    private $record_snmp_ping_rtt;
 
     /** @var \Illuminate\Database\Eloquent\Collection $devices List of devices keyed by hostname */
     private $devices;
@@ -76,16 +78,26 @@ class PingCheck implements ShouldQueue
         $rrd_step = Config::get('ping_rrd_step', Config::get('rrd.step', 300));
         $rrd_def = RrdDefinition::make()->addDataset('ping', 'GAUGE', 0, 65535, $rrd_step * 2);
         $this->rrd_tags = ['rrd_def' => $rrd_def, 'rrd_step' => $rrd_step];
+        $this->use_snmp_ping = Config::get('use_snmp_ping') === true ? true : false;
+        $this->record_snmp_ping_rtt = Config::get('record_snmp_ping_rtt') === true ? true : false;
 
-        // set up fping process
-        $timeout = Config::get('fping_options.timeout', 500); // must be smaller than period
-        $retries = Config::get('fping_options.retries', 2);  // how many retries on failure
-
-        $cmd = ['fping', '-f', '-', '-e', '-t', $timeout, '-r', $retries];
+        if ($this->use_snmp_ping) {
+            // set up sping process
+            $tool = Config::get('snmpstatus', '/usr/bin/snmpstatus');
+            $timeout = Config::get('snmp_ping_timeout', 5);
+            $retries = Config::get('snmp_ping_retries', 2);
+            $env = ['SPING_TOOL' => "$tool", 'SPING_RETRIES' => "$retries", 'SPING_TIMEOUT' => "$timeout"];
+            $cmd = [Config::get('install_dir', '/opt/librenms') . "/sping"];
+        } else {
+            // set up fping process
+            $timeout = Config::get('fping_options.timeout', 500); // must be smaller than period
+            $retries = Config::get('fping_options.retries', 2);  // how many retries on failure
+            $env = [];
+            $cmd = ['fping', '-f', '-', '-e', '-t', $timeout, '-r', $retries];
+        }
 
         $wait = Config::get('rrd.step', 300) * 2;
-
-        $this->process = new Process($cmd, null, null, null, $wait);
+        $this->process = new Process($cmd, null, $env, null, $wait);
     }
 
     /**
@@ -102,11 +114,17 @@ class PingCheck implements ShouldQueue
         d_echo($this->process->getCommandLine() . PHP_EOL);
 
         // send hostnames to stdin to avoid overflowing cli length limits
-        $ordered_device_list = $this->tiered->get(1, collect())->keys()// root nodes before standalone nodes
-        ->merge($this->devices->keys())
-            ->unique()
-            ->implode(PHP_EOL);
-
+        if ($this->use_snmp_ping) {
+            $device_set = $this->tiered->get(1, collect())->keys()->merge($this->devices->keys())->unique();
+            $ordered_device_list = $this->devices->intersectByKeys($device_set->flip())->values()->map(function ($v, $k) {
+                return stringify_sping_arguments($v);
+            })->implode(PHP_EOL) . PHP_EOL;
+        } else {
+            $ordered_device_list = $this->tiered->get(1, collect())->keys()// root nodes before standalone nodes
+            ->merge($this->devices->keys())
+                ->unique()
+                ->implode(PHP_EOL);
+        }
         $this->process->setInput($ordered_device_list);
         $this->process->start(); // start as early as possible
 
@@ -154,10 +172,10 @@ class PingCheck implements ShouldQueue
 
         global $vdebug;
 
+        $base_columns = ['devices.device_id', 'hostname', 'status', 'status_reason', 'last_ping', 'last_ping_timetaken', 'max_depth'];
+        $snmp_columns = ['transport', 'port', 'snmpver', 'community', 'authname', 'authlevel', 'authalgo', 'authpass', 'cryptoalgo', 'cryptopass'];
         /** @var Builder $query */
-        $query = Device::canPing()
-            ->select(['devices.device_id', 'hostname', 'status', 'status_reason', 'last_ping', 'last_ping_timetaken', 'max_depth'])
-            ->orderBy('max_depth');
+        $query = Device::canPing()->select(array_merge($base_columns, ($this->use_snmp_ping ? $snmp_columns : [])))->orderBy('max_depth');
 
         if ($this->groups) {
             $query->whereIn('poller_group', $this->groups);
@@ -244,13 +262,21 @@ class PingCheck implements ShouldQueue
             // mark up only if snmp is not down too
             $device->status = ($data['status'] == 'alive' && $device->status_reason != 'snmp');
             $device->last_ping = Carbon::now();
-            $device->last_ping_timetaken = isset($data['rtt']) ? $data['rtt'] : 0;
+            if (isset($data['rtt'])) {
+                if ($this->use_snmp_ping) {
+                    $device->last_ping_timetaken = ($this->record_snmp_ping_rtt ? floatval($data['rtt']) : (float)0.0);
+                } else {
+                    $device->last_ping_timetaken = floatval($data['rtt']);
+                }
+            } else {
+                $device->last_ping_timetaken = (float)0.0;
+            }
 
             if ($device->isDirty('status')) {
                 // if changed, update reason
-                $device->status_reason = $device->status ? '' : 'icmp';
+                $device->status_reason = $device->status ? '' : ($this->use_snmp_ping ? 'snmp_ping' : 'icmp');
                 $type = $device->status ? 'up' : 'down';
-                Log::event('Device status changed to ' . ucfirst($type) . " from icmp check.", $device->device_id, $type);
+                Log::event('Device status changed to ' . ucfirst($type) . " from ping check.", $device->device_id, $type);
             }
 
             $device->save(); // only saves if needed (which is every time because of last_ping)
