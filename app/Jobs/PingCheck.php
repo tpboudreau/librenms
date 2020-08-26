@@ -35,6 +35,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Collection;
 use LibreNMS\Config;
+use LibreNMS\Sping;
 use LibreNMS\RRD\RrdDefinition;
 use Symfony\Component\Process\Process;
 use LibreNMS\Alert\AlertRules;
@@ -46,6 +47,7 @@ class PingCheck implements ShouldQueue
 
     private $process;
     private $rrd_tags;
+
     private $use_snmp_ping;
     private $record_snmp_ping_rtt;
 
@@ -79,25 +81,19 @@ class PingCheck implements ShouldQueue
         $rrd_def = RrdDefinition::make()->addDataset('ping', 'GAUGE', 0, 65535, $rrd_step * 2);
         $this->rrd_tags = ['rrd_def' => $rrd_def, 'rrd_step' => $rrd_step];
         $this->use_snmp_ping = Config::get('use_snmp_ping') === true ? true : false;
-        $this->record_snmp_ping_rtt = Config::get('record_snmp_ping_rtt') === true ? true : false;
 
         if ($this->use_snmp_ping) {
-            // set up sping process
-            $tool = Config::get('snmpstatus', '/usr/bin/snmpstatus');
-            $timeout = Config::get('snmp_ping_timeout', 5);
-            $retries = Config::get('snmp_ping_retries', 2);
-            $env = ['SPING_TOOL' => "$tool", 'SPING_RETRIES' => "$retries", 'SPING_TIMEOUT' => "$timeout"];
-            $cmd = [Config::get('install_dir', '/opt/librenms') . "/sping"];
+            // set up sping configuration
+            $this->record_snmp_ping_rtt = Config::get('record_snmp_ping_rtt') === true ? true : false;
+            $this->process = NULL;
         } else {
             // set up fping process
             $timeout = Config::get('fping_options.timeout', 500); // must be smaller than period
             $retries = Config::get('fping_options.retries', 2);  // how many retries on failure
-            $env = [];
             $cmd = ['fping', '-f', '-', '-e', '-t', $timeout, '-r', $retries];
+            $wait = Config::get('rrd.step', 300) * 2;
+            $this->process = new Process($cmd, null, null, null, $wait);
         }
-
-        $wait = Config::get('rrd.step', 300) * 2;
-        $this->process = new Process($cmd, null, $env, null, $wait);
     }
 
     /**
@@ -110,22 +106,34 @@ class PingCheck implements ShouldQueue
         $ping_start = microtime(true);
 
         $this->fetchDevices();
+        $device_set = $this->tiered->get(1, collect())->keys()// root nodes before standalone nodes
+            ->merge($this->devices->keys())
+            ->unique();
 
+        if ($this->use_snmp_ping) {
+            $this->handle_sping($device_set);
+        } else {
+            $this->handle_fping($device_set);
+        }
+
+        // check for any left over devices
+        if ($this->deferred->isNotEmpty()) {
+            d_echo("Leftover devices, this shouldn't happen: " . $this->deferred->flatten(1)->implode('hostname', ', ') . PHP_EOL);
+            d_echo("Devices left in tier: " . collect($this->current)->implode('hostname', ', ') . PHP_EOL);
+        }
+
+        if (\App::runningInConsole()) {
+            printf("Pinged %s devices in %.2fs\n", $this->devices->count(), microtime(true) - $ping_start);
+        }
+    }
+
+    private function handle_fping($device_set)
+    {
         d_echo($this->process->getCommandLine() . PHP_EOL);
 
         // send hostnames to stdin to avoid overflowing cli length limits
-        if ($this->use_snmp_ping) {
-            $device_set = $this->tiered->get(1, collect())->keys()->merge($this->devices->keys())->unique();
-            $ordered_device_list = $this->devices->intersectByKeys($device_set->flip())->values()->map(function ($v, $k) {
-                return stringify_sping_arguments($v);
-            })->implode(PHP_EOL) . PHP_EOL;
-        } else {
-            $ordered_device_list = $this->tiered->get(1, collect())->keys()// root nodes before standalone nodes
-            ->merge($this->devices->keys())
-                ->unique()
-                ->implode(PHP_EOL);
-        }
-        $this->process->setInput($ordered_device_list);
+        $fping_input = $device_set->implode(PHP_EOL);
+        $this->process->setInput($fping_input);
         $this->process->start(); // start as early as possible
 
         foreach ($this->process as $type => $line) {
@@ -148,19 +156,23 @@ class PingCheck implements ShouldQueue
                 $captured
             )) {
                 $this->recordData($captured);
-
                 $this->processTier();
             }
         }
+    }
 
-        // check for any left over devices
-        if ($this->deferred->isNotEmpty()) {
-            d_echo("Leftover devices, this shouldn't happen: " . $this->deferred->flatten(1)->implode('hostname', ', ') . PHP_EOL);
-            d_echo("Devices left in tier: " . collect($this->current)->implode('hostname', ', ') . PHP_EOL);
-        }
-
-        if (\App::runningInConsole()) {
-            printf("Pinged %s devices in %.2fs\n", $this->devices->count(), microtime(true) - $ping_start);
+    private function handle_sping($device_set)
+    {
+        $probe = new Sping;
+	$targets = $this->devices->intersectByKeys($device_set->flip())->values();
+        foreach ($targets as $t) {
+            $response = $probe->sping($t);
+            if ($response['result'] === true) {
+                $this->recordData(['hostname' => $t['hostname'], 'status' => 'alive', 'rtt' => $response['last_ping_timetaken']]);
+                $this->processTier();
+            } else {
+                $this->recordData(['hostname' => $t['hostname'], 'status' => 'unreachable', 'rtt' => (float)0.0]);
+            }
         }
     }
 

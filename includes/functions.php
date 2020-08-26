@@ -705,33 +705,9 @@ function isPingable($hostname, $address_family = 'ipv4', $attribs = [])
     ];
 }
 
-function stringify_sping_arguments($device)
-{
-    $target = Device::pollerTarget($device['hostname']);
-    $arguments = collect([$device['transport'], $target, $device['port']]);
-    $version = $device['snmpver'];
-    if (strpos($version, '3') !== false) {
-        $level = $device['authlevel'];
-        if ($level === "authPriv") {
-            $arguments->push(["3AP", $device['authname'], $device['authalgo'], $device['authpass'], $device['cryptoalgo'], $device['cryptopass']]);
-        } else if ($level === "authNoPriv") {
-            $arguments->push(["3A", $device['authname'], $device['authalgo'], $device['authpass']]);
-        } else {
-            $arguments->push(["3", $device['authname']]);
-        }
-    } else {
-        if (strpos($version, '2c') !== false) {
-            $arguments->push(["2c", $device['community']]);
-        } else {
-            $arguments->push(["1", $device['community']]);
-        }
-    }
-    return $arguments->flatten()->implode('|');
-}
-
 function isSPingable($device)
 {
-    return app()->make(Sping::class)->sping(stringify_sping_arguments($device));
+    return app()->make(Sping::class)->sping($device);
 }
 
 function getpollergroup($poller_group = '0')

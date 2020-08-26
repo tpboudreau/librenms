@@ -40,9 +40,11 @@ class Programs extends BaseValidation
     public function validate(Validator $validator)
     {
         // Check programs
-        $base_bins = array('rrdtool', 'snmpwalk', 'snmpget', 'snmpgetnext', 'snmpbulkwalk');
+        $bins = array('rrdtool', 'snmpwalk', 'snmpget', 'snmpgetnext', 'snmpbulkwalk');
         $use_snmp_ping = Config::get('use_snmp_ping') === true ? true : false;
-        $bins = array_merge($base_bins, ($use_snmp_ping ? array('snmpstatus') : array('fping')));
+        if (!$use_snmp_ping) {
+            array_push($bins, 'fping');
+        }
         foreach ($bins as $bin) {
             if (!($cmd = $this->findExecutable($bin))) {
                 $validator->fail(

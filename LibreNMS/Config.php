@@ -436,7 +436,7 @@ class Config
 
         $persist = Eloquent::isConnected();
         // make sure we have full path to binaries in case PATH isn't set
-        foreach (array('fping', 'fping6', 'snmpgetnext', 'snmpstatus', 'rrdtool', 'traceroute', 'traceroute6') as $bin) {
+        foreach (array('fping', 'fping6', 'snmpgetnext', 'rrdtool', 'traceroute', 'traceroute6') as $bin) {
             if (!is_executable(self::get($bin))) {
                 if ($persist) {
                     self::persist($bin, self::locateBinary($bin));
